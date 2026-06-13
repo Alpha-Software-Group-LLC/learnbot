@@ -20,6 +20,10 @@ service cloud.firestore {
       // Updates — owner only, with protected fields.
       // isPro, trialStartDate, stripeSessionId, upgradeDate are SERVER-ONLY
       // (set by /api/verify-payment and /api/webhook via Admin SDK).
+      // learnTokens, referralCount, referralCode, referredBy, referralCredited
+      // are SERVER-ONLY too (set by /api/coach, /api/referral, /api/verify-payment,
+      // /api/webhook). This prevents clients from minting tokens or self-crediting
+      // referrals. The fields are still set at signup via the `create` rule below.
       allow update: if request.auth != null
                     && request.auth.uid == userId
                     && !isChangingProtectedFields();
@@ -34,7 +38,12 @@ service cloud.firestore {
         'trialStartDate',
         'stripeSessionId',
         'upgradeDate',
-        'createdAt'
+        'createdAt',
+        'learnTokens',
+        'referralCount',
+        'referralCode',
+        'referredBy',
+        'referralCredited'
       ]);
     }
 

@@ -13,6 +13,8 @@ if (!admin.apps.length) {
   );
 }
 
+const db = admin.firestore();
+
 // In-memory rate limiting (resets when serverless function cold starts, which is fine)
 const globalCounter = { count: 0, resetDate: '' };
 const userLimits = new Map();
@@ -62,6 +64,53 @@ export default async function handler(req, res) {
   // Use verified UID from token, not client-provided userId
   const verifiedUid = authUser.uid;
 
+  // === VALIDATE MODE (before charging anything) ===
+  const VALID_MODES = ['quiz', 'flashcards', 'summary', 'explain'];
+  if (!VALID_MODES.includes(mode)) return res.status(400).json({ error: 'Invalid mode' });
+
+  // === TOKEN ECONOMY ENFORCEMENT (server-authoritative) ===
+  // Quizzes & flashcards are heavier, so they cost more. Pro users are unlimited.
+  // Tokens are reserved atomically here and refunded below if the AI call fails.
+  const tokenCost = (mode === 'quiz' || mode === 'flashcards') ? 2 : 1;
+  const userRef = db.collection('users').doc(verifiedUid);
+  let isProUser = false;
+  let tokensRemaining = null;
+  try {
+    await db.runTransaction(async (tx) => {
+      const snap = await tx.get(userRef);
+      if (!snap.exists) throw { code: 'NO_USER' };
+      const data = snap.data();
+      if (data.isPro) { isProUser = true; return; }
+      const balance = typeof data.learnTokens === 'number' ? data.learnTokens : 0;
+      if (balance < tokenCost) throw { code: 'INSUFFICIENT', balance };
+      tokensRemaining = balance - tokenCost;
+      tx.update(userRef, { learnTokens: tokensRemaining, updatedAt: new Date().toISOString() });
+    });
+  } catch (e) {
+    if (e && e.code === 'INSUFFICIENT') {
+      return res.status(402).json({ error: 'Not enough tokens for this action. Earn more by studying or grab a token pack.', tokensRemaining: e.balance });
+    }
+    if (e && e.code === 'NO_USER') {
+      return res.status(404).json({ error: 'User account not found.' });
+    }
+    console.error('Token enforcement error:', e);
+    return res.status(500).json({ error: 'Could not verify token balance' });
+  }
+
+  // Refund reserved tokens if we charged the user but the AI call ultimately fails.
+  const refundTokens = async () => {
+    if (isProUser || tokensRemaining === null) return;
+    try {
+      await userRef.update({
+        learnTokens: admin.firestore.FieldValue.increment(tokenCost),
+        updatedAt: new Date().toISOString()
+      });
+      tokensRemaining += tokenCost;
+    } catch (refundErr) {
+      console.error('Token refund failed:', refundErr.message);
+    }
+  };
+
   // === GLOBAL DAILY BUDGET ===
   const today = new Date().toISOString().split('T')[0];
   if (globalCounter.resetDate !== today) {
@@ -69,7 +118,8 @@ export default async function handler(req, res) {
     globalCounter.resetDate = today;
   }
   if (globalCounter.count >= DAILY_GLOBAL_BUDGET) {
-    return res.status(429).json({ error: 'LearnBot is resting — too many students today! Try again tomorrow.' });
+    await refundTokens();
+    return res.status(429).json({ error: 'LearnBot is resting — too many students today! Try again tomorrow.', tokensRemaining });
   }
 
   // === PER-USER HOURLY LIMIT (using verified UID) ===
@@ -78,7 +128,8 @@ export default async function handler(req, res) {
   const userHistory = userLimits.get(verifiedUid).filter(t => t > now - 3600000);
   userLimits.set(verifiedUid, userHistory);
   if (userHistory.length >= USER_HOURLY_LIMIT) {
-    return res.status(429).json({ error: 'Slow down! Take a break and try again in a bit.' });
+    await refundTokens();
+    return res.status(429).json({ error: 'Slow down! Take a break and try again in a bit.', tokensRemaining });
   }
   userHistory.push(now);
   globalCounter.count++;
@@ -94,7 +145,6 @@ export default async function handler(req, res) {
   };
 
   const systemPrompt = prompts[mode];
-  if (!systemPrompt) return res.status(400).json({ error: 'Invalid mode' });
 
   const maxTokens = (mode === 'quiz' || mode === 'flashcards') ? 1500 : 800;
 
@@ -116,8 +166,9 @@ export default async function handler(req, res) {
     if (!response.ok) {
       const errText = await response.text();
       console.error('Anthropic error:', response.status, errText);
-      if (response.status === 429) return res.status(429).json({ error: 'AI is busy, try again in a moment.' });
-      return res.status(500).json({ error: 'AI service error' });
+      await refundTokens();
+      if (response.status === 429) return res.status(429).json({ error: 'AI is busy, try again in a moment.', tokensRemaining });
+      return res.status(500).json({ error: 'AI service error', tokensRemaining });
     }
 
     const data = await response.json();
@@ -135,12 +186,14 @@ export default async function handler(req, res) {
       parsed = JSON.parse(clean);
     } catch (parseErr) {
       console.error('Parse error:', clean.substring(0, 200));
-      return res.status(500).json({ error: 'Failed to parse AI response' });
+      await refundTokens();
+      return res.status(500).json({ error: 'Failed to parse AI response', tokensRemaining });
     }
 
-    return res.status(200).json({ result: parsed });
+    return res.status(200).json({ result: parsed, tokensRemaining, isPro: isProUser });
   } catch (err) {
     console.error('Coach error:', err);
-    return res.status(500).json({ error: 'Internal server error' });
+    await refundTokens();
+    return res.status(500).json({ error: 'Internal server error', tokensRemaining });
   }
 }
